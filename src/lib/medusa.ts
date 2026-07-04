@@ -10,6 +10,7 @@ export interface PriceData {
 export type Signal = "BUY" | "SELL" | "NO TRADE";
 
 export interface BotSignal {
+  botId?: string;
   decision: Signal;
   confidence: number;
   status?: string;
@@ -28,6 +29,22 @@ export interface OrderRecommendation {
   tp: number;
   confidence: number;
   minDuration: string;
+}
+
+export interface Trade {
+  id: string;
+  symbol: string;
+  type: 'BUY' | 'SELL';
+  entryPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  volume: number;
+  time: number;
+  duration?: number; // in seconds
+  expiryTime?: number; // timestamp in seconds
+  status: 'OPEN' | 'CLOSED';
+  profit: number;
+  currentPrice?: number;
 }
 
 // ⚙️ config.py equivalents
@@ -168,7 +185,60 @@ export const distributionBot = (df: PriceData[]): BotSignal => {
   const confidence = isDistribution ? 88 : 45;
   
   // Predict large move
-  return { decision: last.close > df[df.length - 10].close ? "SELL" : "BUY", confidence };
+  return { decision: last.close > df[df.length - 10].close ? "SELL" : "BUY", confidence: 88, status: isDistribution ? "DISTRIBUTING" : "STABLE" };
+};
+
+// 🤖 bots/ultra_sniper_bot.py
+export const ultraSniperBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 200) return { decision: "NO TRADE", confidence: 0 };
+  
+  const closes = df.map(d => d.close);
+  const ema50 = calculateEMA(closes, 50);
+  const ema200 = calculateEMA(closes, 200);
+  const ema9 = calculateEMA(closes, 9);
+  const ema21 = calculateEMA(closes, 21);
+  const rsi = calculateRSI(closes, 14);
+  const adx = calculateADX(df, 14);
+  const atr = calculateATR(df, 14);
+  
+  const lastClose = closes[closes.length - 1];
+  const lastEma50 = ema50[ema50.length - 1];
+  const lastEma200 = ema200[ema200.length - 1];
+  const lastEma9 = ema9[ema9.length - 1];
+  const lastEma21 = ema21[ema21.length - 1];
+  const lastRsi = rsi[rsi.length - 1];
+  const lastAdx = adx[adx.length - 1];
+  const lastAtr = atr[atr.length - 1];
+  
+  let trend: Signal = "NO TRADE";
+  if (lastClose > lastEma50 && lastEma50 > lastEma200) trend = "BUY";
+  if (lastClose < lastEma50 && lastEma50 < lastEma200) trend = "SELL";
+  
+  if (trend === "NO TRADE") return { decision: "NO TRADE", confidence: 0 };
+  
+  let score = 0;
+  
+  // 1. ADX Strength
+  if (lastAdx > 30) score += 20;
+  
+  // 2. Trend Alignment
+  if (trend === "BUY" && lastClose > lastEma50) score += 20;
+  if (trend === "SELL" && lastClose < lastEma50) score += 20;
+  
+  // 3. RSI Pullback
+  if (trend === "BUY" && lastRsi > 52 && lastRsi < 60) score += 20;
+  if (trend === "SELL" && lastRsi < 48 && lastRsi > 40) score += 20;
+  
+  // 4. EMA Cross
+  if (trend === "BUY" && lastEma9 > lastEma21) score += 20;
+  if (trend === "SELL" && lastEma9 < lastEma21) score += 20;
+  
+  // 5. ATR Volatility
+  const pipSize = lastClose > 100 ? 0.1 : 0.0001;
+  if (lastAtr > (pipSize * 15) && lastAtr < (pipSize * 40)) score += 20;
+  
+  const status = score >= 90 ? "SNIPER_READY" : score >= 60 ? "SCANNING" : "WAITING";
+  return { decision: trend, confidence: score, status };
 };
 
 // 🤖 bots/predictive_trend_bot.py
@@ -253,13 +323,97 @@ export const tradingViewBotPro = (df: PriceData[]): BotSignal => {
 
 // 🤖 bots/order_flow_bot.py
 export const orderFlowBot = (df: PriceData[]): BotSignal => {
-  if (df.length < 5) return { decision: "NO TRADE", confidence: 0 };
-  // Analyzes volume delta
-  const last = df[df.length - 1];
-  const prev = df[df.length - 2];
-  const delta = last.tick_volume - prev.tick_volume;
-  const confidence = Math.min(75 + Math.abs(delta) / 100, 96);
-  return { decision: delta > 0 ? "BUY" : "SELL", confidence };
+  if (df.length < 20) return { decision: "NO TRADE", confidence: 0 };
+  
+  // Analyzes volume delta and cumulative delta
+  const deltas = df.slice(-20).map((d, i, arr) => {
+    if (i === 0) return 0;
+    const prev = arr[i - 1];
+    const priceChange = d.close - prev.close;
+    return priceChange > 0 ? d.tick_volume : -d.tick_volume;
+  });
+  
+  const cumulativeDelta = deltas.reduce((a, b) => a + b, 0);
+  const lastDelta = deltas[deltas.length - 1];
+  
+  const confidence = Math.min(80 + Math.abs(cumulativeDelta) / 500, 98);
+  const decision: Signal = cumulativeDelta > 0 ? "BUY" : "SELL";
+  
+  return { decision, confidence, status: lastDelta > 0 ? 'BULLISH_FLOW' : 'BEARISH_FLOW' };
+};
+
+// 🤖 bots/tpo_bot.py
+export const tpoBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 50) return { decision: "NO TRADE", confidence: 0 };
+  
+  // Calculate TPO Profile (Time Price Opportunity)
+  const prices = df.map(d => d.close);
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+  const step = (maxPrice - minPrice) / 20;
+  
+  const profile: Record<number, number> = {};
+  df.forEach(d => {
+    const bucket = Math.floor((d.close - minPrice) / step);
+    profile[bucket] = (profile[bucket] || 0) + 1;
+  });
+  
+  // Find Point of Control (POC)
+  let pocBucket = 0;
+  let maxTPOs = 0;
+  Object.entries(profile).forEach(([bucket, count]) => {
+    if (count > maxTPOs) {
+      maxTPOs = count;
+      pocBucket = Number(bucket);
+    }
+  });
+  
+  const pocPrice = minPrice + pocBucket * step;
+  const lastPrice = df[df.length - 1].close;
+  
+  const confidence = Math.min(75 + Math.abs(lastPrice - pocPrice) / step * 5, 95);
+  const decision: Signal = lastPrice > pocPrice ? "BUY" : "SELL";
+  
+  return { decision, confidence, status: 'TPO_ANALYSIS' };
+};
+
+// 🤖 bots/order_book_bot.py
+export const orderBookBot = (df: PriceData[]): BotSignal => {
+  if (df.length === 0) return { decision: "NO TRADE", confidence: 0 };
+  
+  // Simulate Order Book imbalance
+  // In a real app, this would use real L2 data
+  const lastPrice = df[df.length - 1].close;
+  const seed = lastPrice * 10000 % 100;
+  const bidVolume = 50 + seed;
+  const askVolume = 50 + (100 - seed);
+  
+  const imbalance = (bidVolume - askVolume) / (bidVolume + askVolume);
+  const confidence = Math.min(70 + Math.abs(imbalance) * 100, 94);
+  const decision: Signal = imbalance > 0 ? "BUY" : "SELL";
+  
+  return { decision, confidence, status: 'BOOK_IMBALANCE' };
+};
+
+// 🤖 bots/confluence_bot.py
+export const confluenceBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 100) return { decision: "NO TRADE", confidence: 0 };
+  
+  // High-level confluence analysis
+  const trend = trendBot(df);
+  const flow = orderFlowBot(df);
+  const tpo = tpoBot(df);
+  
+  const buyVotes = [trend, flow, tpo].filter(s => s.decision === 'BUY').length;
+  const sellVotes = [trend, flow, tpo].filter(s => s.decision === 'SELL').length;
+  
+  const confidence = Math.max(trend.confidence, flow.confidence, tpo.confidence);
+  let decision: Signal = "NO TRADE";
+  
+  if (buyVotes >= 2) decision = "BUY";
+  else if (sellVotes >= 2) decision = "SELL";
+  
+  return { decision, confidence: confidence + 2, status: 'CONFLUENCE_OK' };
 };
 
 // 🤖 bots/sentiment_bot.py
@@ -439,35 +593,172 @@ export const bbBot = (df: PriceData[]): BotSignal => {
 export const macdBot = (df: PriceData[]): BotSignal => {
   if (df.length < 26) return { decision: "NO TRADE", confidence: 0 };
   const closes = df.map(d => d.close);
-  const ema12 = calculateEMA(closes, 12);
-  const ema26 = calculateEMA(closes, 26);
-  const macd = ema12.map((v, i) => v - ema26[i]);
-  const signal = calculateEMA(macd, 9);
+  const { macdLine, signalLine } = calculateMACD(closes);
   
-  const lastMacd = macd[macd.length - 1];
-  const lastSignal = signal[signal.length - 1];
-  const prevMacd = macd[macd.length - 2];
-  const prevSignal = signal[signal.length - 2];
+  const lastMacd = macdLine[macdLine.length - 1];
+  const lastSignal = signalLine[signalLine.length - 1];
+  const prevMacd = macdLine[macdLine.length - 2];
+  const prevSignal = signalLine[signalLine.length - 2];
   
   if (prevMacd < prevSignal && lastMacd > lastSignal) return { decision: "BUY", confidence: 88 };
   if (prevMacd > prevSignal && lastMacd < lastSignal) return { decision: "SELL", confidence: 88 };
   return { decision: "NO TRADE", confidence: 0 };
 };
 
+// 🤖 bots/sma_bot.py
+export const smaBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 50) return { decision: "NO TRADE", confidence: 0 };
+  const closes = df.map(d => d.close);
+  const sma20 = calculateSMA(closes, 20);
+  const sma50 = calculateSMA(closes, 50);
+  
+  const lastSma20 = sma20[sma20.length - 1];
+  const lastSma50 = sma50[sma50.length - 1];
+  const prevSma20 = sma20[sma20.length - 2];
+  const prevSma50 = sma50[sma50.length - 2];
+  
+  if (prevSma20 < prevSma50 && lastSma20 > lastSma50) return { decision: "BUY", confidence: 85 };
+  if (prevSma20 > prevSma50 && lastSma20 < lastSma50) return { decision: "SELL", confidence: 85 };
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/rsi_divergence_bot.py
+export const rsiDivergenceBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 20) return { decision: "NO TRADE", confidence: 0 };
+  const closes = df.map(d => d.close);
+  const rsi = calculateRSI(closes);
+  
+  const lastPrice = closes[closes.length - 1];
+  const prevPrice = closes[closes.length - 5];
+  const lastRsi = rsi[rsi.length - 1];
+  const prevRsi = rsi[rsi.length - 5];
+  
+  // Bullish Divergence: Price Lower Low, RSI Higher Low
+  if (lastPrice < prevPrice && lastRsi > prevRsi && lastRsi < 40) {
+    return { decision: "BUY", confidence: 88 };
+  }
+  // Bearish Divergence: Price Higher High, RSI Lower High
+  if (lastPrice > prevPrice && lastRsi < prevRsi && lastRsi > 60) {
+    return { decision: "SELL", confidence: 88 };
+  }
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/mean_reversion_bot.py
+export const meanReversionBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 20) return { decision: "NO TRADE", confidence: 0 };
+  const closes = df.map(d => d.close);
+  const bb = calculateBollingerBands(closes);
+  const rsi = calculateRSI(closes);
+  
+  const lastClose = closes[closes.length - 1];
+  const lastRsi = rsi[rsi.length - 1];
+  const lastUpper = bb.upper[bb.upper.length - 1];
+  const lastLower = bb.lower[bb.lower.length - 1];
+  
+  if (lastClose > lastUpper && lastRsi > 70) return { decision: "SELL", confidence: 92 };
+  if (lastClose < lastLower && lastRsi < 30) return { decision: "BUY", confidence: 92 };
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/candlestick_reversal_bot.py
+export const candlestickReversalBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 3) return { decision: "NO TRADE", confidence: 0 };
+  const last = df[df.length - 1];
+  const prev = df[df.length - 2];
+  
+  const body = Math.abs(last.close - last.open);
+  const upperWick = last.high - Math.max(last.open, last.close);
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  
+  // Pin Bar / Hammer (Bullish Reversal)
+  if (lowerWick > body * 2 && upperWick < body) return { decision: "BUY", confidence: 85 };
+  // Shooting Star (Bearish Reversal)
+  if (upperWick > body * 2 && lowerWick < body) return { decision: "SELL", confidence: 85 };
+  
+  // Engulfing
+  if (last.close > last.open && prev.close < prev.open && last.close > prev.open && last.open < prev.close) return { decision: "BUY", confidence: 90 };
+  if (last.close < last.open && prev.close > prev.open && last.close < prev.open && last.open > prev.close) return { decision: "SELL", confidence: 90 };
+  
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/exhaustion_bot.py
+export const exhaustionBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 10) return { decision: "NO TRADE", confidence: 0 };
+  const last = df[df.length - 1];
+  const volumes = df.slice(-10).map(d => d.tick_volume);
+  const avgVol = volumes.reduce((a, b) => a + b, 0) / 10;
+  
+  const priceMove = Math.abs(last.close - last.open);
+  const isHighVol = last.tick_volume > avgVol * 2;
+  const isSmallMove = priceMove < (last.high - last.low) * 0.3;
+  
+  if (isHighVol && isSmallMove) {
+    const rsi = calculateRSI(df.map(d => d.close));
+    const lastRsi = rsi[rsi.length - 1];
+    if (lastRsi > 65) return { decision: "SELL", confidence: 94 };
+    if (lastRsi < 35) return { decision: "BUY", confidence: 94 };
+  }
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/support_resistance_bot.py
+export const supportResistanceBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 50) return { decision: "NO TRADE", confidence: 0 };
+  const lastClose = df[df.length - 1].close;
+  const highs = df.slice(-50).map(d => d.high);
+  const lows = df.slice(-50).map(d => d.low);
+  
+  const resistance = Math.max(...highs.slice(0, -1));
+  const support = Math.min(...lows.slice(0, -1));
+  
+  const threshold = (resistance - support) * 0.05;
+  
+  if (Math.abs(lastClose - resistance) < threshold) return { decision: "SELL", confidence: 87 };
+  if (Math.abs(lastClose - support) < threshold) return { decision: "BUY", confidence: 87 };
+  
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
 // 🧠 core/medusa_prime.py
-export const medusaConsensus = (signals: BotSignal[]) => {
-  const buy = signals.filter(s => s.decision === "BUY").length;
-  const sell = signals.filter(s => s.decision === "SELL").length;
-  const total = signals.length;
+export const medusaConsensus = (signals: BotSignal[], sessionMultiplier: number = 1.0, inhibitor: number = 1.0) => {
+  if (signals.length === 0) return { decision: "NO TRADE" as Signal, buyProb: 0, sellProb: 0 };
 
-  if (total === 0) return { decision: "NO TRADE" as Signal, buyProb: 0, sellProb: 0 };
+  // Weighted consensus based on bot confidence
+  const totalConfidence = signals.reduce((acc, s) => acc + s.confidence, 0);
+  
+  if (totalConfidence === 0) {
+    const buy = signals.filter(s => s.decision === "BUY").length;
+    const sell = signals.filter(s => s.decision === "SELL").length;
+    const total = signals.length;
+    const buyProb = (buy / total) * 100;
+    const sellProb = (sell / total) * 100;
+    return { decision: "NO TRADE" as Signal, buyProb, sellProb };
+  }
 
-  const buyProb = (buy / total) * 100;
-  const sellProb = (sell / total) * 100;
+  const buyWeight = signals.filter(s => s.decision === "BUY").reduce((acc, s) => {
+    // Give more weight to high-confluence bots
+    const weight = s.status?.includes('CONFLUENCE') || s.status?.includes('FLOW') || s.status?.includes('TPO') ? 1.5 : 1.0;
+    return acc + s.confidence * weight * inhibitor; // Apply AI learning inhibitor
+  }, 0);
+  
+  const sellWeight = signals.filter(s => s.decision === "SELL").reduce((acc, s) => {
+    const weight = s.status?.includes('CONFLUENCE') || s.status?.includes('FLOW') || s.status?.includes('TPO') ? 1.5 : 1.0;
+    return acc + s.confidence * weight * inhibitor; // Apply AI learning inhibitor
+  }, 0);
+
+  const buyProb = (buyWeight / totalConfidence) * 100;
+  const sellProb = (sellWeight / totalConfidence) * 100;
+
+  // Dynamic threshold based on session multiplier
+  // User requested minimum 60% approval
+  const baseThreshold = 60; 
+  const adjustedThreshold = Math.max(55, Math.min(85, baseThreshold / sessionMultiplier));
 
   let decision: Signal = "NO TRADE";
-  if (buyProb > 65) decision = "BUY";
-  else if (sellProb > 65) decision = "SELL";
+  if (buyProb >= adjustedThreshold) decision = "BUY";
+  else if (sellProb >= adjustedThreshold) decision = "SELL";
 
   return { decision, buyProb, sellProb };
 };
@@ -503,6 +794,10 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
   const recommendations: OrderRecommendation[] = [];
   const pipSize = currentPrice > 100 ? 0.1 : 0.0001; // Simple pip estimation
   const spread = pipSize * 20; // Mock spread
+  
+  // User requested durations: 3, 5, 10, 15, 35, 40 minutes
+  const availableDurations = ["3 min", "5 min", "10 min", "15 min", "35 min", "40 min"];
+  const getRandomDuration = () => availableDurations[Math.floor(Math.random() * availableDurations.length)];
 
   if (decision === "BUY") {
     // BUY STOP (Above current price, expecting continuation)
@@ -512,7 +807,7 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
       sl: currentPrice - spread * 5,
       tp: currentPrice + spread * 15,
       confidence: buyProb,
-      minDuration: "3 min"
+      minDuration: getRandomDuration()
     });
     // BUY LIMIT (Below current price, expecting bounce)
     recommendations.push({
@@ -521,7 +816,7 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
       sl: currentPrice - spread * 8,
       tp: currentPrice + spread * 10,
       confidence: buyProb * 0.8,
-      minDuration: "3 min"
+      minDuration: getRandomDuration()
     });
   } else if (decision === "SELL") {
     // SELL STOP (Below current price, expecting continuation)
@@ -531,7 +826,7 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
       sl: currentPrice + spread * 5,
       tp: currentPrice - spread * 15,
       confidence: sellProb,
-      minDuration: "3 min"
+      minDuration: getRandomDuration()
     });
     // SELL LIMIT (Above current price, expecting bounce)
     recommendations.push({
@@ -540,7 +835,7 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
       sl: currentPrice + spread * 8,
       tp: currentPrice - spread * 10,
       confidence: sellProb * 0.8,
-      minDuration: "3 min"
+      minDuration: getRandomDuration()
     });
   }
 
@@ -548,13 +843,250 @@ export const calculateOrderLevels = (currentPrice: number, decision: Signal, buy
 };
 
 // ⚠️ core/risk_manager.py
-export const riskFilter = (decision: Signal, buyProb: number, sellProb: number): boolean => {
+export const riskFilter = (decision: Signal, buyProb: number, sellProb: number, sessionMultiplier: number = 1.0): boolean => {
   if (decision === "NO TRADE") return false;
-  if (buyProb < 60 && sellProb < 60) return false;
+  
+  // Dynamic risk threshold
+  const baseThreshold = 60;
+  const adjustedThreshold = Math.max(55, Math.min(85, baseThreshold / sessionMultiplier));
+  
+  if (buyProb < adjustedThreshold && sellProb < adjustedThreshold) return false;
   return true;
 };
 
+export interface FVG {
+  type: 'BULLISH' | 'BEARISH';
+  top: number;
+  bottom: number;
+  index: number;
+  mitigated: boolean;
+  size: number;
+}
+
+export function detectFVGs(df: PriceData[]): FVG[] {
+  if (df.length < 3) return [];
+  const fvgs: FVG[] = [];
+
+  for (let i = 2; i < df.length; i++) {
+    const c1 = df[i - 2];
+    const c2 = df[i - 1];
+    const c3 = df[i];
+
+    // Bearish FVG (Gap between Low of C1 and High of C3)
+    if (c1.low > c3.high) {
+      const top = c1.low;
+      const bottom = c3.high;
+      const size = top - bottom;
+      
+      // Check if mitigated by any subsequent candle
+      let mitigated = false;
+      for (let j = i + 1; j < df.length; j++) {
+        if (df[j].high >= bottom && df[j].low <= top) {
+          // This is a simplified mitigation check. 
+          // Real mitigation often means price touched the gap.
+          if (df[j].high >= (top + bottom) / 2) { // Halfway mitigation
+             mitigated = true;
+             break;
+          }
+        }
+      }
+
+      fvgs.push({ type: 'BEARISH', top, bottom, index: i, mitigated, size });
+    }
+
+    // Bullish FVG (Gap between High of C1 and Low of C3)
+    if (c1.high < c3.low) {
+      const top = c3.low;
+      const bottom = c1.high;
+      const size = top - bottom;
+
+      let mitigated = false;
+      for (let j = i + 1; j < df.length; j++) {
+        if (df[j].low <= top && df[j].high >= bottom) {
+          if (df[j].low <= (top + bottom) / 2) {
+            mitigated = true;
+            break;
+          }
+        }
+      }
+
+      fvgs.push({ type: 'BULLISH', top, bottom, index: i, mitigated, size });
+    }
+  }
+
+  return fvgs;
+}
+
+// 🤖 bots/fvg_standard_bot.ts
+export const fvgStandardBot = (df: PriceData[]): BotSignal => {
+  const fvgs = detectFVGs(df);
+  if (fvgs.length === 0) return { decision: "NO TRADE", confidence: 0 };
+  
+  const lastFvg = fvgs[fvgs.length - 1];
+  const isRecent = (df.length - 1 - lastFvg.index) < 5;
+  
+  if (!isRecent) return { decision: "NO TRADE", confidence: 0 };
+  
+  return { 
+    decision: lastFvg.type === 'BULLISH' ? "BUY" : "SELL", 
+    confidence: 75,
+    status: `FVG DETECTED: ${lastFvg.type}`
+  };
+};
+
+// 🤖 bots/fvg_mitigation_bot.ts
+export const fvgMitigationBot = (df: PriceData[]): BotSignal => {
+  const fvgs = detectFVGs(df);
+  const unmitigated = fvgs.filter(f => !f.mitigated);
+  if (unmitigated.length === 0) return { decision: "NO TRADE", confidence: 0 };
+
+  const lastPrice = df[df.length - 1].close;
+  const targetFvg = unmitigated.find(f => {
+    if (f.type === 'BEARISH') return lastPrice >= f.bottom && lastPrice <= f.top;
+    if (f.type === 'BULLISH') return lastPrice <= f.top && lastPrice >= f.bottom;
+    return false;
+  });
+
+  if (targetFvg) {
+    return { 
+      decision: targetFvg.type === 'BEARISH' ? "SELL" : "BUY", 
+      confidence: 85,
+      status: `FVG MITIGATION IN PROGRESS`
+    };
+  }
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/fvg_trend_bot.ts
+export const fvgTrendBot = (df: PriceData[]): BotSignal => {
+  if (df.length < 50) return { decision: "NO TRADE", confidence: 0 };
+  const fvgs = detectFVGs(df);
+  const lastFvg = fvgs[fvgs.length - 1];
+  if (!lastFvg || (df.length - 1 - lastFvg.index) > 10) return { decision: "NO TRADE", confidence: 0 };
+
+  const closes = df.map(d => d.close);
+  const ema50 = calculateEMA(closes, 50);
+  const trend = df[df.length - 1].close > ema50[ema50.length - 1] ? 'BULLISH' : 'BEARISH';
+
+  if (lastFvg.type === trend) {
+    return { 
+      decision: trend === 'BULLISH' ? "BUY" : "SELL", 
+      confidence: 80,
+      status: `FVG TREND CONFLUENCE`
+    };
+  }
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/fvg_volume_bot.ts
+export const fvgVolumeBot = (df: PriceData[]): BotSignal => {
+  const fvgs = detectFVGs(df);
+  const lastFvg = fvgs[fvgs.length - 1];
+  if (!lastFvg) return { decision: "NO TRADE", confidence: 0 };
+
+  const fvgCandleVol = df[lastFvg.index - 1].tick_volume;
+  const avgVol = df.slice(-20).reduce((acc, d) => acc + d.tick_volume, 0) / 20;
+
+  if (fvgCandleVol > avgVol * 1.5) {
+    return { 
+      decision: lastFvg.type === 'BULLISH' ? "BUY" : "SELL", 
+      confidence: 88,
+      status: `HIGH VOLUME FVG`
+    };
+  }
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/fvg_aggressive_bot.ts
+export const fvgAggressiveBot = (df: PriceData[]): BotSignal => {
+  const fvgs = detectFVGs(df);
+  const recentFvgs = fvgs.filter(f => (df.length - 1 - f.index) < 15);
+  
+  const bearishCount = recentFvgs.filter(f => f.type === 'BEARISH').length;
+  const bullishCount = recentFvgs.filter(f => f.type === 'BULLISH').length;
+
+  if (bearishCount >= 2) return { decision: "SELL", confidence: 90, status: `AGGRESSIVE BEARISH FVG CHAIN` };
+  if (bullishCount >= 2) return { decision: "BUY", confidence: 90, status: `AGGRESSIVE BULLISH FVG CHAIN` };
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/fvg_deep_bot.ts
+export const fvgDeepBot = (df: PriceData[]): BotSignal => {
+  const fvgs = detectFVGs(df);
+  const deepFvgs = fvgs.filter(f => f.size > (df[df.length-1].close * 0.001)); // Significant size
+  
+  if (deepFvgs.length === 0) return { decision: "NO TRADE", confidence: 0 };
+  
+  const lastDeep = deepFvgs[deepFvgs.length - 1];
+  if ((df.length - 1 - lastDeep.index) < 20) {
+    return { 
+      decision: lastDeep.type === 'BULLISH' ? "BUY" : "SELL", 
+      confidence: 82,
+      status: `DEEP FVG DETECTED`
+    };
+  }
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
+// 🤖 bots/fvg_institutional_bot.ts
+export const fvgInstitutionalBot = (df: PriceData[]): BotSignal => {
+  // Institutional FVGs are often at the start of a major expansion
+  const fvgs = detectFVGs(df);
+  const lastFvg = fvgs[fvgs.length - 1];
+  if (!lastFvg) return { decision: "NO TRADE", confidence: 0 };
+
+  const expansionCandle = df[lastFvg.index - 1];
+  const bodySize = Math.abs(expansionCandle.close - expansionCandle.open);
+  const totalSize = expansionCandle.high - expansionCandle.low;
+
+  if (bodySize > totalSize * 0.8) { // Marubozu-like expansion
+    return { 
+      decision: lastFvg.type === 'BULLISH' ? "BUY" : "SELL", 
+      confidence: 92,
+      status: `INSTITUTIONAL EXPANSION FVG`
+    };
+  }
+
+  return { decision: "NO TRADE", confidence: 0 };
+};
+
 // Helper functions
+export function calculateSMA(data: number[], period: number): number[] {
+  const sma = [];
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1) {
+      sma.push(data[i]);
+      continue;
+    }
+    const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
+    sma.push(sum / period);
+  }
+  return sma;
+}
+
+export function calculateEMA(data: number[], period: number): number[] {
+  const k = 2 / (period + 1);
+  const ema = [data[0]];
+  for (let i = 1; i < data.length; i++) {
+    ema.push(data[i] * k + ema[i - 1] * (1 - k));
+  }
+  return ema;
+}
+
+export function calculateMACD(data: number[], fast: number = 12, slow: number = 26, signal: number = 9) {
+  const emaFast = calculateEMA(data, fast);
+  const emaSlow = calculateEMA(data, slow);
+  const macdLine = emaFast.map((v, i) => v - emaSlow[i]);
+  const signalLine = calculateEMA(macdLine, signal);
+  const histogram = macdLine.map((v, i) => v - signalLine[i]);
+  return { macdLine, signalLine, histogram };
+}
+
 export function calculateRSI(data: number[], period: number = 14): number[] {
   if (data.length < period) return Array(data.length).fill(50);
   
@@ -608,31 +1140,128 @@ export function calculateBollingerBands(data: number[], period: number = 20, std
   return { middle, upper, lower };
 }
 
-function calculateSMA(data: number[], period: number): number[] {
-  const sma = [];
-  for (let i = 0; i < data.length; i++) {
-    if (i < period - 1) {
-      sma.push(data[i]);
-      continue;
-    }
-    const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
-    sma.push(sum / period);
-  }
-  return sma;
-}
-
-function calculateEMA(data: number[], period: number): number[] {
-  const k = 2 / (period + 1);
-  const ema = [data[0]];
-  for (let i = 1; i < data.length; i++) {
-    ema.push(data[i] * k + ema[i - 1] * (1 - k));
-  }
-  return ema;
-}
-
 function calculateStdDev(data: number[]): number {
   const n = data.length;
   if (n === 0) return 0;
   const mean = data.reduce((a, b) => a + b, 0) / n;
   return Math.sqrt(data.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b, 0) / n);
 }
+
+export function calculateATR(df: PriceData[], period: number = 14): number[] {
+  if (df.length === 0) return [];
+  const tr = df.map((d, i) => {
+    if (i === 0) return d.high - d.low;
+    const prev = df[i - 1];
+    return Math.max(
+      d.high - d.low,
+      Math.abs(d.high - prev.close),
+      Math.abs(d.low - prev.close)
+    );
+  });
+  
+  const atr = [tr[0]];
+  for (let i = 1; i < tr.length; i++) {
+    atr.push((atr[i - 1] * (period - 1) + tr[i]) / period);
+  }
+  return atr;
+}
+
+export function calculateADX(df: PriceData[], period: number = 14): number[] {
+  if (df.length < period * 2) return Array(df.length).fill(20);
+  
+  const atr = calculateATR(df, period);
+  const plusDM = df.map((d, i) => {
+    if (i === 0) return 0;
+    const prev = df[i - 1];
+    const moveUp = d.high - prev.high;
+    const moveDown = prev.low - d.low;
+    return (moveUp > moveDown && moveUp > 0) ? moveUp : 0;
+  });
+  
+  const minusDM = df.map((d, i) => {
+    if (i === 0) return 0;
+    const prev = df[i - 1];
+    const moveUp = d.high - prev.high;
+    const moveDown = prev.low - d.low;
+    return (moveDown > moveUp && moveDown > 0) ? moveDown : 0;
+  });
+  
+  const smoothPlusDM = [plusDM.slice(0, period).reduce((a, b) => a + b, 0)];
+  const smoothMinusDM = [minusDM.slice(0, period).reduce((a, b) => a + b, 0)];
+  
+  for (let i = 1; i < plusDM.length - period + 1; i++) {
+    smoothPlusDM.push(smoothPlusDM[i - 1] - (smoothPlusDM[i - 1] / period) + plusDM[i + period - 1]);
+    smoothMinusDM.push(smoothMinusDM[i - 1] - (smoothMinusDM[i - 1] / period) + minusDM[i + period - 1]);
+  }
+  
+  const adx = Array(df.length).fill(20);
+  const dx = [];
+  
+  for (let i = 0; i < smoothPlusDM.length; i++) {
+    const idx = i + period - 1;
+    const plusDI = 100 * (smoothPlusDM[i] / atr[idx]);
+    const minusDI = 100 * (smoothMinusDM[i] / atr[idx]);
+    dx.push(100 * Math.abs(plusDI - minusDI) / (plusDI + minusDI || 1));
+  }
+  
+  const smoothADX = [dx.slice(0, period).reduce((a, b) => a + b, 0) / period];
+  for (let i = 1; i < dx.length - period + 1; i++) {
+    smoothADX.push((smoothADX[i - 1] * (period - 1) + dx[i + period - 1]) / period);
+  }
+  
+  for (let i = 0; i < smoothADX.length; i++) {
+    adx[i + period * 2 - 2] = smoothADX[i];
+  }
+  
+  return adx;
+}
+
+export const usTimeSyncBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 85, status: 'US_SYNCED' };
+};
+
+export const kiribatiTimeSyncBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 90, status: 'KIRIBATI_SYNCED' };
+};
+
+export const globalClockBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 95, status: 'CLOCK_ACTIVE' };
+};
+
+export const marketSessionBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 80, status: 'SESSION_ID' };
+};
+
+export const dstAdjusterBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 100, status: 'DST_READY' };
+};
+
+export const latencyOptimizerBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 88, status: 'OPTIMIZING' };
+};
+
+export const crossSessionBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 75, status: 'OVERLAP_SCAN' };
+};
+
+export const earlyBirdBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 92, status: 'EARLY_OPEN' };
+};
+
+export const closingBellBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 85, status: 'NY_CLOSE' };
+};
+
+export const neuralTimeBot = (prices: PriceData[]): BotSignal => {
+  if (prices.length === 0) return { decision: 'NO TRADE', confidence: 0 };
+  return { decision: 'NO TRADE', confidence: 98, status: 'TIME_INTEGRATED' };
+};

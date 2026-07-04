@@ -7,19 +7,27 @@ import {
   CandlestickData, 
   LineData, 
   BarData,
+  HistogramData,
   SeriesMarker, 
   CandlestickSeries, 
   LineSeries,
   BarSeries,
+  HistogramSeries,
   Time,
   MouseEventParams
 } from 'lightweight-charts';
 import { 
   PriceData, 
   BotSignal, 
+  Trade,
   calculateGainzAlgo, 
   calculateRSI, 
-  calculateBollingerBands 
+  calculateBollingerBands,
+  calculateSMA,
+  calculateEMA,
+  calculateMACD,
+  detectFVGs,
+  FVG
 } from '../lib/medusa';
 import { 
   TrendingUp, 
@@ -32,17 +40,33 @@ import {
   EyeOff,
   Settings2,
   Maximize2,
-  Minimize2
+  Minimize2,
+  BarChart,
+  Database,
+  ArrowRightLeft
 } from 'lucide-react';
+
+interface ConsensusEntry {
+  time: Time;
+  buyProb: number;
+  sellProb: number;
+  decision: string;
+}
 
 interface MT5ChartProps {
   data: PriceData[];
   signals: BotSignal[];
+  decision?: string;
+  buyProb?: number;
+  sellProb?: number;
   symbol: string;
   timeframe: string;
   chartType: 'candles' | 'bars';
   onChartTypeChange?: (type: 'candles' | 'bars') => void;
   themeColor?: string;
+  trades?: Trade[];
+  consensusHistory?: ConsensusEntry[];
+  timezone?: string;
 }
 
 interface Trendline {
@@ -51,7 +75,21 @@ interface Trendline {
   p2: { time: Time; price: number };
 }
 
-export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timeframe, chartType, onChartTypeChange, themeColor = 'emerald' }) => {
+export const MT5Chart: React.FC<MT5ChartProps> = ({ 
+  data, 
+  signals, 
+  decision,
+  buyProb,
+  sellProb,
+  symbol, 
+  timeframe, 
+  chartType, 
+  onChartTypeChange, 
+  themeColor = 'emerald',
+  trades = [],
+  consensusHistory = [],
+  timezone = 'America/New_York'
+}) => {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const rsiContainerRef = useRef<HTMLDivElement>(null);
   
@@ -68,14 +106,31 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
   const gainzLowerSeriesRef = useRef<any>(null);
   const gainzSignalSeriesRef = useRef<any>(null);
   const rsiSeriesRef = useRef<any>(null);
+  const confidenceSeriesRef = useRef<any>(null);
+  const tpoPocSeriesRef = useRef<any>(null);
+  const tpoVaUpperSeriesRef = useRef<any>(null);
+  const tpoVaLowerSeriesRef = useRef<any>(null);
   
+  const macdContainerRef = useRef<HTMLDivElement>(null);
+  const macdChartRef = useRef<IChartApi | null>(null);
+  const macdLineSeriesRef = useRef<any>(null);
+  const macdSignalSeriesRef = useRef<any>(null);
+  const macdHistogramSeriesRef = useRef<any>(null);
+  const sma20SeriesRef = useRef<any>(null);
+  const sma50SeriesRef = useRef<any>(null);
+
   const trendlineSeriesRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map());
+  const tradePriceLinesRef = useRef<any[]>([]);
 
   // UI State
   const [showEMA, setShowEMA] = useState(true);
   const [showBB, setShowBB] = useState(false);
   const [showGainz, setShowGainz] = useState(true);
   const [showRSI, setShowRSI] = useState(true);
+  const [showMACD, setShowMACD] = useState(false);
+  const [showSMA, setShowSMA] = useState(false);
+  const [showTPO, setShowTPO] = useState(false);
+  const [showFVG, setShowFVG] = useState(true);
   const [drawMode, setDrawMode] = useState<'none' | 'trendline'>('none');
   const [trendlines, setTrendlines] = useState<Trendline[]>([]);
   const [drawingPoints, setDrawingPoints] = useState<{ time: Time; price: number }[]>([]);
@@ -102,6 +157,27 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
         timeVisible: true,
         secondsVisible: false,
         borderColor: 'rgba(255, 255, 255, 0.1)',
+        tickMarkFormatter: (time: number) => {
+          const date = new Date(time * 1000);
+          return new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+          }).format(date);
+        }
+      },
+      localization: {
+        timeFormatter: (time: number) => {
+          const date = new Date(time * 1000);
+          return new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+          }).format(date);
+        },
       },
       rightPriceScale: {
         borderColor: 'rgba(255, 255, 255, 0.1)',
@@ -149,6 +225,28 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
     gainzUpperSeriesRef.current = chart.addSeries(LineSeries, { color: 'rgba(139, 92, 246, 0.3)', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false });
     gainzLowerSeriesRef.current = chart.addSeries(LineSeries, { color: 'rgba(139, 92, 246, 0.3)', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false });
     gainzSignalSeriesRef.current = chart.addSeries(LineSeries, { color: '#8b5cf6', lineWidth: 2, lastValueVisible: true, priceLineVisible: false });
+
+    // TPO Indicators
+    tpoPocSeriesRef.current = chart.addSeries(LineSeries, { color: '#ef4444', lineWidth: 2, lastValueVisible: true, priceLineVisible: false, title: 'POC' });
+    tpoVaUpperSeriesRef.current = chart.addSeries(LineSeries, { color: 'rgba(239, 68, 68, 0.3)', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false, title: 'VAH' });
+    tpoVaLowerSeriesRef.current = chart.addSeries(LineSeries, { color: 'rgba(239, 68, 68, 0.3)', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false, title: 'VAL' });
+
+    sma20SeriesRef.current = chart.addSeries(LineSeries, { color: '#3b82f6', lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
+    sma50SeriesRef.current = chart.addSeries(LineSeries, { color: '#f43f5e', lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
+
+    // Confidence Series (Histogram at bottom)
+    confidenceSeriesRef.current = chart.addSeries(HistogramSeries, {
+      color: 'rgba(16, 185, 129, 0.2)',
+      priceFormat: { type: 'percent' },
+      priceScaleId: 'confidence',
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+
+    chart.priceScale('confidence').applyOptions({
+      scaleMargins: { top: 0.85, bottom: 0 },
+      visible: false,
+    });
 
     // RSI Chart - Split into separate effect to handle conditional rendering
     // This effect only runs once to set up the main chart
@@ -213,7 +311,7 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
         rsiSeriesRef.current = null;
       }
     };
-  }, [drawMode, drawingPoints, isFullscreen, chartType]);
+  }, [drawMode, drawingPoints, isFullscreen, chartType, timezone]);
 
   // RSI Chart Initialization & Sync
   useEffect(() => {
@@ -302,7 +400,99 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
       rsiChartRef.current = null;
       rsiSeriesRef.current = null;
     };
-  }, [showRSI, isFullscreen]); // Re-init when toggled or resized
+  }, [showRSI, isFullscreen, timezone]); // Re-init when toggled or resized
+
+  // MACD Chart Initialization & Sync
+  useEffect(() => {
+    if (!showMACD || !macdContainerRef.current || !chartRef.current) {
+      if (macdChartRef.current) {
+        macdChartRef.current.remove();
+        macdChartRef.current = null;
+        macdLineSeriesRef.current = null;
+        macdSignalSeriesRef.current = null;
+        macdHistogramSeriesRef.current = null;
+      }
+      return;
+    }
+
+    const macdChart = createChart(macdContainerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: '#0a0a0a' },
+        textColor: '#d1d5db',
+        fontSize: 10,
+        fontFamily: 'JetBrains Mono, monospace',
+      },
+      grid: {
+        vertLines: { color: 'rgba(255, 255, 255, 0.03)' },
+        horzLines: { color: 'rgba(255, 255, 255, 0.03)' },
+      },
+      width: macdContainerRef.current.clientWidth,
+      height: 120,
+      timeScale: {
+        visible: false,
+        timeVisible: true,
+        secondsVisible: false,
+        borderColor: 'rgba(255, 255, 255, 0.1)',
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(255, 255, 255, 0.1)',
+        autoScale: true,
+      },
+      crosshair: {
+        mode: 0,
+        vertLine: { width: 1 as any, color: 'rgba(255, 255, 255, 0.2)', style: 3 },
+        horzLine: { width: 1 as any, color: 'rgba(255, 255, 255, 0.2)', style: 3 },
+      },
+      handleScroll: true,
+      handleScale: true,
+    });
+
+    macdChartRef.current = macdChart;
+    macdLineSeriesRef.current = macdChart.addSeries(LineSeries, { color: '#3b82f6', lineWidth: 1, lastValueVisible: true });
+    macdSignalSeriesRef.current = macdChart.addSeries(LineSeries, { color: '#f43f5e', lineWidth: 1, lastValueVisible: true });
+    macdHistogramSeriesRef.current = macdChart.addSeries(HistogramSeries, {
+      color: '#10b981',
+      lastValueVisible: false,
+    });
+
+    // Sync with main chart
+    const mainChart = chartRef.current;
+    if (!mainChart) return;
+
+    const syncMainToMacd = (range: any) => {
+      if (range && macdChartRef.current) {
+        try {
+          macdChartRef.current.timeScale().setVisibleRange(range);
+        } catch (e) {}
+      }
+    };
+    const syncMacdToMain = (range: any) => {
+      if (range && chartRef.current) {
+        try {
+          chartRef.current.timeScale().setVisibleRange(range);
+        } catch (e) {}
+      }
+    };
+
+    mainChart.timeScale().subscribeVisibleTimeRangeChange(syncMainToMacd);
+    macdChart.timeScale().subscribeVisibleTimeRangeChange(syncMacdToMain);
+
+    return () => {
+      try {
+        if (mainChart && chartRef.current === mainChart) {
+          mainChart.timeScale().unsubscribeVisibleTimeRangeChange(syncMainToMacd);
+        }
+        if (macdChart && macdChartRef.current === macdChart) {
+          macdChart.timeScale().unsubscribeVisibleTimeRangeChange(syncMacdToMain);
+          macdChart.remove();
+        }
+      } catch (e) {}
+      macdChartRef.current = null;
+      macdLineSeriesRef.current = null;
+      macdSignalSeriesRef.current = null;
+      macdHistogramSeriesRef.current = null;
+    };
+  }, [showMACD, isFullscreen, timezone]);
 
   // Update Data & Indicators
   useEffect(() => {
@@ -410,26 +600,150 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
       rsiSeriesRef.current.setData(rsi.map((v, i) => ({ time: data[i].time as any, value: v })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
     }
 
-    // Markers
-    const lastIdx = data.length - 1;
-    const lastSignal = signals[0];
-    if (lastSignal?.decision !== 'NO TRADE' && data[lastIdx]?.time && candlestickSeriesRef.current) {
-      try {
-        if (typeof candlestickSeriesRef.current.setMarkers === 'function') {
-          candlestickSeriesRef.current.setMarkers([{
-            time: data[lastIdx].time as any,
-            position: lastSignal.decision === 'BUY' ? 'belowBar' : 'aboveBar',
-            color: lastSignal.decision === 'BUY' ? '#10b981' : '#f43f5e',
-            shape: lastSignal.decision === 'BUY' ? 'arrowUp' : 'arrowDown',
-            text: lastSignal.decision,
-          }]);
-        }
-      } catch (e) {
-        // Series might be disposed
+    // SMA
+    if (showSMA && sma20SeriesRef.current) {
+      const sma20 = calculateSMA(closes, 20);
+      const sma50 = calculateSMA(closes, 50);
+      sma20SeriesRef.current.setData(sma20.map((v, i) => ({ time: data[i].time as any, value: v })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
+      sma50SeriesRef.current.setData(sma50.map((v, i) => ({ time: data[i].time as any, value: v })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
+    } else if (sma20SeriesRef.current) {
+      sma20SeriesRef.current.setData([]);
+      sma50SeriesRef.current.setData([]);
+    }
+
+    // MACD
+    if (showMACD && macdLineSeriesRef.current) {
+      const { macdLine, signalLine, histogram } = calculateMACD(closes);
+      macdLineSeriesRef.current.setData(macdLine.map((v, i) => ({ time: data[i].time as any, value: v })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
+      macdSignalSeriesRef.current.setData(signalLine.map((v, i) => ({ time: data[i].time as any, value: v })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
+      macdHistogramSeriesRef.current.setData(histogram.map((v, i) => ({ 
+        time: data[i].time as any, 
+        value: v,
+        color: v >= 0 ? 'rgba(16, 185, 129, 0.5)' : 'rgba(244, 63, 94, 0.5)'
+      })).filter(p => p.time !== null && p.time !== undefined && typeof p.value === 'number' && Number.isFinite(p.value)));
+    }
+
+    // FVG Markers
+    if (showFVG && candlestickSeriesRef.current) {
+      const fvgs = detectFVGs(data);
+      const markers: SeriesMarker<Time>[] = fvgs.map(f => ({
+        time: data[f.index].time as Time,
+        position: f.type === 'BULLISH' ? 'belowBar' : 'aboveBar',
+        color: f.type === 'BULLISH' ? '#10b981' : '#f43f5e',
+        shape: f.type === 'BULLISH' ? 'arrowUp' : 'arrowDown',
+        text: `FVG ${f.mitigated ? '(M)' : ''}`,
+      }));
+      
+      // Merge with existing markers if any (like trades)
+      if (typeof candlestickSeriesRef.current.setMarkers === 'function') {
+        candlestickSeriesRef.current.setMarkers(markers);
+      }
+    } else if (candlestickSeriesRef.current) {
+      if (typeof candlestickSeriesRef.current.setMarkers === 'function') {
+        candlestickSeriesRef.current.setMarkers([]);
       }
     }
 
-  }, [data, signals, showEMA, showBB, showGainz, showRSI, chartType]);
+    // TPO Calculation
+    if (showTPO && tpoPocSeriesRef.current) {
+      const prices = data.map(d => d.close);
+      const minPrice = Math.min(...prices);
+      const maxPrice = Math.max(...prices);
+      const step = (maxPrice - minPrice) / 20;
+      
+      const profile: Record<number, number> = {};
+      data.forEach(d => {
+        const bucket = Math.floor((d.close - minPrice) / step);
+        profile[bucket] = (profile[bucket] || 0) + 1;
+      });
+      
+      let pocBucket = 0;
+      let maxTPOs = 0;
+      Object.entries(profile).forEach(([bucket, count]) => {
+        if (count > maxTPOs) {
+          maxTPOs = count;
+          pocBucket = Number(bucket);
+        }
+      });
+      
+      const pocPrice = minPrice + pocBucket * step;
+      const vah = pocPrice + step * 3;
+      const val = pocPrice - step * 3;
+      
+      tpoPocSeriesRef.current.setData(data.map(d => ({ time: d.time as any, value: pocPrice })));
+      tpoVaUpperSeriesRef.current.setData(data.map(d => ({ time: d.time as any, value: vah })));
+      tpoVaLowerSeriesRef.current.setData(data.map(d => ({ time: d.time as any, value: val })));
+    } else if (tpoPocSeriesRef.current) {
+      tpoPocSeriesRef.current.setData([]);
+      tpoVaUpperSeriesRef.current.setData([]);
+      tpoVaLowerSeriesRef.current.setData([]);
+    }
+
+    // Confidence History
+    if (confidenceSeriesRef.current && consensusHistory.length > 0) {
+      const confidenceData: HistogramData[] = consensusHistory.map(h => {
+        const confidence = h.decision === 'BUY' ? h.buyProb : h.decision === 'SELL' ? h.sellProb : 0;
+        const color = h.decision === 'BUY' 
+          ? `rgba(16, 185, 129, ${Math.max(0.1, confidence / 100)})` 
+          : h.decision === 'SELL' 
+            ? `rgba(244, 63, 94, ${Math.max(0.1, confidence / 100)})` 
+            : 'rgba(113, 113, 122, 0.1)';
+        
+        return {
+          time: h.time,
+          value: confidence,
+          color: color
+        };
+      });
+      confidenceSeriesRef.current.setData(confidenceData);
+    }
+
+    // Markers
+    const lastIdx = data.length - 1;
+    if (data[lastIdx]?.time && candlestickSeriesRef.current) {
+      const markers: SeriesMarker<Time>[] = [];
+
+      // 1. Consensus Marker
+      if (decision && decision !== 'NO TRADE') {
+        markers.push({
+          time: data[lastIdx].time as any,
+          position: decision === 'BUY' ? 'belowBar' : 'aboveBar',
+          color: decision === 'BUY' ? '#10b981' : '#f43f5e',
+          shape: decision === 'BUY' ? 'arrowUp' : 'arrowDown',
+          text: `CONSENSUS: ${decision} (${(decision === 'BUY' ? buyProb : sellProb)?.toFixed(1)}%)`,
+          size: 2
+        });
+      }
+
+      // 2. Neural High-Confidence Markers (Top 3)
+      const highConfSignals = [...signals]
+        .filter(s => s.decision !== 'NO TRADE' && s.confidence > 90)
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, 3);
+
+      highConfSignals.forEach((s, i) => {
+        markers.push({
+          time: data[lastIdx].time as any,
+          position: s.decision === 'BUY' ? 'belowBar' : 'aboveBar',
+          color: s.decision === 'BUY' ? '#34d399' : '#fb7185',
+          shape: 'circle',
+          text: `${(s.botId || 'bot').split('_')[0]}: ${s.decision}`,
+          size: 1
+        });
+      });
+
+      if (markers.length > 0) {
+        try {
+          if (typeof candlestickSeriesRef.current.setMarkers === 'function') {
+            candlestickSeriesRef.current.setMarkers(markers);
+          }
+        } catch (e) {
+          // Series might be disposed
+        }
+      }
+    }
+
+  }, [data, signals, showEMA, showBB, showGainz, showRSI, showSMA, showMACD, showTPO, showFVG, chartType, decision, buyProb, sellProb, consensusHistory]);
 
   // Handle Trendlines Rendering
   useEffect(() => {
@@ -465,6 +779,61 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
       }
     });
   }, [trendlines]);
+  
+  // Handle Trade Price Lines
+  useEffect(() => {
+    if (!candlestickSeriesRef.current) return;
+    const series = candlestickSeriesRef.current;
+
+    // Clear old trade lines
+    tradePriceLinesRef.current.forEach(line => {
+      try {
+        if (typeof series.removePriceLine === 'function') {
+          series.removePriceLine(line);
+        }
+      } catch (e) {}
+    });
+    tradePriceLinesRef.current = [];
+
+    // Filter trades for current symbol
+    const activeTrades = trades.filter(t => t.symbol === symbol && t.status === 'OPEN');
+
+    activeTrades.forEach(trade => {
+      // Entry Line
+      if (typeof series.createPriceLine === 'function') {
+        const entryLine = series.createPriceLine({
+          price: trade.entryPrice,
+          color: trade.type === 'BUY' ? '#10b981' : '#f43f5e',
+          lineWidth: 2,
+          lineStyle: 0, // Solid
+          axisLabelVisible: true,
+          title: `${trade.type} ENTRY`,
+        });
+        
+        // SL Line
+        const slLine = series.createPriceLine({
+          price: trade.stopLoss,
+          color: '#f43f5e',
+          lineWidth: 1,
+          lineStyle: 2, // Dashed
+          axisLabelVisible: true,
+          title: 'SL',
+        });
+
+        // TP Line
+        const tpLine = series.createPriceLine({
+          price: trade.takeProfit,
+          color: '#10b981',
+          lineWidth: 1,
+          lineStyle: 2, // Dashed
+          axisLabelVisible: true,
+          title: 'TP',
+        });
+
+        tradePriceLinesRef.current.push(entryLine, slLine, tpLine);
+      }
+    });
+  }, [trades, symbol]);
 
   const clearTrendlines = () => {
     setTrendlines([]);
@@ -510,6 +879,12 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
               EMA {showEMA ? <Eye size={12} /> : <EyeOff size={12} />}
             </button>
             <button 
+              onClick={() => setShowSMA(!showSMA)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showSMA ? 'bg-blue-500/10 border-blue-500/20 text-blue-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
+            >
+              SMA {showSMA ? <Eye size={12} /> : <EyeOff size={12} />}
+            </button>
+            <button 
               onClick={() => setShowBB(!showBB)}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showBB ? 'bg-blue-500/10 border-blue-500/20 text-blue-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
             >
@@ -526,6 +901,24 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showRSI ? 'bg-amber-500/10 border-amber-500/20 text-amber-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
             >
               RSI {showRSI ? <Eye size={12} /> : <EyeOff size={12} />}
+            </button>
+            <button 
+              onClick={() => setShowMACD(!showMACD)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showMACD ? 'bg-rose-500/10 border-rose-500/20 text-rose-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
+            >
+              MACD {showMACD ? <Eye size={12} /> : <EyeOff size={12} />}
+            </button>
+            <button 
+              onClick={() => setShowFVG(!showFVG)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showFVG ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
+            >
+              FVG {showFVG ? <Eye size={12} /> : <EyeOff size={12} />}
+            </button>
+            <button 
+              onClick={() => setShowTPO(!showTPO)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${showTPO ? 'bg-rose-500/10 border-rose-500/20 text-rose-500' : 'bg-white/5 border-white/5 text-zinc-500'}`}
+            >
+              TPO {showTPO ? <Eye size={12} /> : <EyeOff size={12} />}
             </button>
           </div>
 
@@ -578,6 +971,22 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
               </span>
             </div>
           )}
+          {decision && decision !== 'NO TRADE' && (
+            <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest ${decision === 'BUY' ? 'bg-emerald-500 text-black' : 'bg-rose-500 text-black'}`}>
+              <TrendingUp size={10} />
+              Neural Consensus: {decision} ({(decision === 'BUY' ? buyProb : sellProb)?.toFixed(1)}%)
+            </div>
+          )}
+          <div className="flex gap-2">
+            <div className="flex items-center gap-2 px-3 py-1 bg-zinc-900/80 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-zinc-400">
+              <ArrowRightLeft size={10} />
+              Order Flow: {data.length > 1 && (data[data.length-1].tick_volume - data[data.length-2].tick_volume > 0 ? 'BULLISH' : 'BEARISH')}
+            </div>
+            <div className="flex items-center gap-2 px-3 py-1 bg-zinc-900/80 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-zinc-400">
+              <Database size={10} />
+              Book: {((data[data.length-1]?.close * 10000 % 100) > 50 ? 'BID HEAVY' : 'ASK HEAVY')}
+            </div>
+          </div>
           {drawMode === 'trendline' && (
             <div className="flex items-center gap-2 px-3 py-1 bg-amber-500 text-black rounded-full text-[9px] font-black uppercase tracking-widest animate-pulse">
               <Pencil size={10} />
@@ -598,6 +1007,20 @@ export const MT5Chart: React.FC<MT5ChartProps> = ({ data, signals, symbol, timef
             </div>
           </div>
           <div ref={rsiContainerRef} className="w-full h-[120px]" />
+        </div>
+      )}
+
+      {/* MACD Area */}
+      {showMACD && (
+        <div className="border-t border-white/5 bg-black/20">
+          <div className="px-6 py-1 flex items-center justify-between">
+            <span className="text-[9px] font-black text-rose-500/50 uppercase tracking-widest">MACD (12, 26, 9)</span>
+            <div className="flex gap-4 text-[9px] font-mono text-zinc-600">
+              <span>MACD LINE</span>
+              <span>SIGNAL LINE</span>
+            </div>
+          </div>
+          <div ref={macdContainerRef} className="w-full h-[120px]" />
         </div>
       )}
     </div>

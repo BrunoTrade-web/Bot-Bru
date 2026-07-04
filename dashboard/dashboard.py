@@ -43,7 +43,7 @@ st.subheader("Neural Consensus Engine v4.0")
 
 # Sidebar
 st.sidebar.header("Market Controls")
-selected_symbol = st.sidebar.selectbox("Select Symbol", ["XAUUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "EURJPY", "GBPJPY", "BTCUSD", "ETHUSD"])
+selected_symbol = st.sidebar.selectbox("Select Symbol", ["XAUUSD"])
 
 # Timeframe Switcher
 timeframe = st.sidebar.radio("Select Timeframe", ["M5", "H1"], index=0)
